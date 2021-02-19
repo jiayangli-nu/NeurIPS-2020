@@ -2,6 +2,7 @@ import time
 import math
 import torch
 import cvxpy as cp
+import networkx as nx
 from queue import Queue
 from cvxpylayers.torch import CvxpyLayer
 
@@ -10,7 +11,10 @@ class User(object):
     
     def __init__(self, n):
         self.node_number = n
+        self.ds = None
+        self.dt = None
         self.q = None # Tensor of Denmand of O-D pairs
+        self.q_path = None
         self.demand_number = None # Number of O-D pairs
         self.od = dict() # od[source] = list of sinks
         self.od_serial = torch.zeros(n, n, dtype=torch.int64)
@@ -32,12 +36,22 @@ class User(object):
         self.edge_serial = None 
         # edge_serial[source, sink] = edge serial number
         self.f = dict()
+        self.p_vec = None
+        self.f_vec = None
+        self.pool = dict()
         self.path = dict()
+        self.path_vec = [list(), list()]
+        self.path_mat = None
         self.cost = dict()
+        self.cost_vec = None
         self.rgap = dict()
+        self.indicator = dict()
+    
         
     def set_demand(self, ds, dt, q):
         self.q = q
+        self.ds = ds
+        self.dt = dt
         self.demand_number = len(q)
         self.od_serial[ds, dt] = torch.arange(self.demand_number)
         
@@ -63,7 +77,7 @@ class User(object):
             self.potential = lambda x: sum(intF(x))
         if dF:
             self.dF = dF
-        
+            
     def update_topology(self):
         n = self.node_number
         m = self.edge_number
@@ -105,48 +119,101 @@ class User(object):
     
     def initialize_path(self):
         m = self.edge_number
+        es = self.es
+        et = self.et
+        ds = self.ds
+        dt = self.dt
+        G = nx.DiGraph()
+        E = [(int(es[k]), int(et[k]), self.time[k]) for k in range(m)]
+        G.add_weighted_edges_from(E)
+        shortest_path = dict(nx.all_pairs_bellman_ford_path(G))
         flow = torch.zeros(m, dtype=torch.double)
-        for source in self.source:
-            prev, dist = self.shortest_path_tree(source) 
-            for sink in self.od[int(source)]:
-                k = self.od_serial[source, sink]
-                self.path[int(k)] = list()
-                self.f[int(k)] = torch.tensor([self.q[k]])
-                self.cost[int(k)] = torch.tensor([dist[sink]])
-                t = sink
-                while t != source:
-                    s = prev[t]
-                    a = self.edge_serial[s, t]
-                    flow[a] += self.q[k]
-                    self.path[int(k)].append([a, 0])
-                    t = s                    
+        self.f_vec = 1.0 * self.q
+        self.cost_vec = torch.zeros_like(self.q)
+        for k in range(len(self.q)):
+            path = shortest_path[int(ds[k])][int(dt[k])]
+            edges = self.edge_serial[es[path[:-1]], et[path[1:]]]
+            self.cost_vec[k] = torch.sum(self.time[edges])
+            self.pool[k] = [k]
+            flow[edges] += self.q[k]
+            for a in edges:
+                self.path_vec[0].append(int(a))
+                self.path_vec[1].append(k)
         self.x = flow
-    
+        
     def update_path(self):
         m = self.edge_number
-        flow = torch.zeros(m, dtype=torch.double)
+        es = self.es
+        et = self.et
+        ds = self.ds
+        dt = self.dt
+        G = nx.DiGraph()
+        E = [(int(es[k]), int(et[k]), self.time[k]) for k in range(m)]
+        G.add_weighted_edges_from(E)
+        shortest_path = dict(nx.all_pairs_bellman_ford_path(G))
         greedy_cost = 0
-        for source in self.source:
-            prev, dist = self.shortest_path_tree(source)
-            for sink in self.od[int(source)]:
-                k = self.od_serial[source, sink]
-                greedy_cost += self.q[k] * dist[sink]
-                if torch.min(torch.abs(self.cost[int(k)] - dist[sink])) < 1e-10:
-                    continue
-                path = list()
-                self.f[int(k)] = torch.cat((self.f[int(k)], torch.tensor([0], dtype=torch.double)))
-                self.cost[int(k)] = torch.cat((self.cost[int(k)], torch.tensor([dist[sink]])))
-                t = sink
-                while t != source:
-                    s = prev[t]
-                    a = self.edge_serial[s, t]
-                    flow[a] += self.q[k]
-                    path.append([a, len(self.f[int(k)]) - 1])
-                    t = s
+        n_path = len(self.f_vec)
+        new_cost = list()
+        l = 0
+        for k in range(len(self.q)):
+            path = shortest_path[int(ds[k])][int(dt[k])]
+            edges = self.edge_serial[es[path[:-1]], et[path[1:]]]
+            c_min = torch.sum(self.time[edges])
+            greedy_cost += self.q[k] * c_min
+            path_k = self.pool[k]
+            if torch.min(torch.abs(self.cost_vec[path_k] - c_min)) < 1e-10:
+                continue
+            self.pool[k].append(n_path + l)
+            new_cost.append(c_min)
+            for a in edges:
+                self.path_vec[0].append(int(a))
+                self.path_vec[1].append(n_path + l)
+            l += 1
+        self.cost_vec = torch.cat((self.cost_vec, torch.tensor(new_cost)))
+        zero_vector = torch.zeros(len(new_cost), dtype=torch.double)
+        self.f_vec = torch.cat((self.f_vec, zero_vector))
+        self.vectorization()
 
-                self.path[int(k)].extend(path)
         return greedy_cost
     
+    def vectorization(self):
+        m = self.edge_number
+        l = len(self.f_vec)
+        i = torch.tensor(self.path_vec, dtype=torch.int64)
+        v = torch.ones(len(self.path_vec[0]), dtype=torch.double)
+        self.path_mat = torch.sparse.FloatTensor(i, v, torch.Size([m, l]))
+        self.q_path = torch.zeros(l, dtype=torch.double)
+        for k in range(len(self.q)):
+            self.q_path[self.pool[k]] = self.q[k]
+            
+#    def vectorization(self):
+#        m = self.edge_number
+#        i_edge = list()
+#        i_path = list()
+#        l = 0
+#        for source in self.source:
+#            for sink in self.od[int(source)]:
+#                k = self.od_serial[source, sink]
+#                self.pool[int(k)] = l + torch.arange(len(self.f[int(k)]))
+#                for pair in self.path[int(k)]:
+#                    i_edge.append(pair[0])
+#                    i_path.append(l + pair[1])
+#                l += len(self.f[int(k)])
+#        i = torch.tensor([i_edge, i_path], dtype=torch.int64)
+#        v = torch.ones(len(i_edge), dtype=torch.double)
+#        self.path_mat = torch.sparse.FloatTensor(i, v, torch.Size([m, l]))
+#        self.f_vec = torch.zeros(l, dtype=torch.double)
+#        self.p_vec = torch.zeros(l, dtype=torch.double)
+#        self.q_path = torch.zeros(l, dtype=torch.double)
+#        self.cost_vec = torch.zeros(l, dtype=torch.double)
+#        for source in self.source:
+#            for sink in self.od[int(source)]:
+#                k = self.od_serial[source, sink]
+#                self.q_path[self.pool[int(k)]] = self.q[int(k)]
+#                self.f_vec[self.pool[int(k)]] = self.f[int(k)]
+#                self.p_vec[self.pool[int(k)]] = self.f[int(k)] / self.q[int(k)]
+#                self.cost_vec[self.pool[int(k)]] = self.cost[int(k)]
+#    
     def remove_path(self):
         for source in self.source:
             for sink in self.od[int(source)]:
@@ -217,36 +284,20 @@ class User(object):
         self.f[int(k)] = f_new
         self.x += self.assign_edge_flow(o, d)
         
-#    def newton_move(self, o, d):
-#        k = self.od_serial[o, d]
-#        if len(self.f[int(k)]) == 1:
-#            return
-#        f = self.f[int(k)]      
-#        cost = self.assign_path_cost(o, d)
-#        dcost = self.assign_path_dcost(o, d)
-#        
-#        l_min = torch.argmin(cost)
-#        g = cost - cost[l_min]
-#        
-#        dcost = torch.zeros(len(self.f[int(k)]), dtype=torch.double)
-#        m = self.edge_number
-#        a_min = torch.zeros(m, dtype=torch.double)
-#        for pair in self.path[int(k)]:
-#            dcost[pair[1]] += self.dtime[pair[0]]
-#            if pair[1] == l_min:
-#                a_min[pair[0]] = 1 
-#        h = dcost + dcost[l_min]
-#        for pair in self.path[int(k)]:
-#            if pair[1] != l_min:
-#                h[pair[1]] -= 2 * a_min[pair[0]] * self.dtime[pair[0]]
-#                
-#        f_new = f - g / h
-#        f_new = f_new.clamp(0)
-#        f_new[l_min] = 0
-#        f_new[l_min] = self.q[k] - torch.sum(f_new)
-#        self.x -= self.assign_edge_flow(o, d)
-#        self.f[int(k)] = f_new
-#        self.x += self.assign_edge_flow(o, d)
+    def no_regret_learning(self):
+        r = self.r
+        self.p_vec *= torch.exp(-r * self.cost_vec)
+        p_sum = torch.zeros_like(self.p_vec)
+        for o in self.source:
+            for d in self.od[int(o)]:
+                k = self.od_serial[o, d]
+                path_k = self.pool[int(k)]
+                p = self.p_vec[path_k]
+                p_sum[path_k] = torch.sum(p)
+        self.p_vec /= p_sum
+                
+        self.f_vec = self.p_vec * self.q_path
+        self.x = sparse_product(self.path_mat, self.f_vec)
     
     def assign_edge_flow(self, o, d):
         m = self.edge_number
@@ -330,10 +381,7 @@ class Network(object):
                 
     def update_path_cost(self):
         for u in self.active_users:
-            for source in self.users[u].source:
-                for sink in self.users[u].od[int(source)]:
-                    k = self.users[u].od_serial[source, sink]
-                    self.users[u].cost[int(k)] = self.users[u].assign_path_cost(source, sink)       
+            self.users[u].cost_vec = sparse_product(self.users[u].path_mat.t(), self.users[u].time)    
                 
     def adjust_r(self):
         accelerate = True
@@ -370,7 +418,7 @@ class Network(object):
                 break
         return accelerate
                         
-    def user_equilibrium(self, active_users, epsilon=1e-3, delta=0, display=False):
+    def greedy_method(self, active_users, epsilon=1e-3, delta=0, display=False):
         self.active_users = active_users
         self.r = 0.5
         for u in self.active_users:
@@ -382,10 +430,7 @@ class Network(object):
         self.x = torch.zeros(self.class_number, m, dtype=torch.double)
         self.update_edge_cost()     
         for u in self.active_users:
-            tic = time.time()
             self.users[u].initialize_path()
-            toc = time.time()
-            print('sp:', toc - tic)
         self.update()
         
         iter_number = 0
@@ -430,7 +475,6 @@ class Network(object):
                             self.users[u].newton_move(o, d)
                             self.update_edge_flow()
                             self.users[u].time = self.users[u].F(self.x[:, fe])
-                self.update()
 #                l = 0
 #                FC_old = math.inf
 #                while l < 50:
@@ -457,6 +501,75 @@ class Network(object):
             
             for u in self.active_users:
                 self.users[u].remove_path()
+        self.update_path_cost()
+                
+        return self.x_sum
+    
+    def hybrid_method(self, active_users, epsilon=1e-3, delta=0, display=False):
+        self.active_users = active_users
+        self.r = 0.5
+        for u in self.active_users:
+            self.users[u].r = self.r
+        self.gap = list()
+        
+        m = self.edge_number
+        self.x_sum = torch.zeros(m, dtype=torch.double)
+        self.x = torch.zeros(self.class_number, m, dtype=torch.double)
+        self.update_edge_cost()     
+        for u in self.active_users:
+            self.users[u].initialize_path()
+            self.users[u].vectorization()
+            
+        self.update()
+        
+        iter_number = 0
+        rg_old = math.inf
+
+        while iter_number < 1000:
+            greedy_cost = 0
+            actual_cost = 0
+            for u in self.active_users:
+                greedy_cost += self.users[u].update_path()
+                actual_cost += torch.dot(self.users[u].time, self.users[u].x)
+            rg = 1 - greedy_cost / actual_cost
+            g = actual_cost - greedy_cost
+            if display:
+                print('iter:', iter_number, 'relative gap:', rg, 'gap', g)     
+            
+            self.gap.append(rg)            
+            if rg < epsilon:
+                break
+
+            if rg > delta:
+                if rg / rg_old > 0.999:
+                    self.r = max(0.8 * self.r, 1e-5)
+                    for u in range(len(self.users)):
+                        self.users[u].r = self.r
+                rg_old = rg
+                for u in self.active_users:
+                    self.users[u].x = torch.zeros(m, dtype=torch.double)
+                    for o in self.users[u].source:
+                        for d in self.users[u].od[int(o)]:
+                            k = self.users[u].od_serial[o, d]
+                            self.users[u].f[int(k)] = self.users[u].projection_eu(o, d)
+                            self.users[u].x += self.users[u].assign_edge_flow(o, d)
+                self.update()
+            else:
+                for u in self.active_users:
+                    for o in self.users[u].source:
+                        sink = self.users[u].od[int(o)]
+                        for d in sink:
+                            fe = self.users[u].feasible_edge
+                            self.users[u].dtime = self.users[u].dF(self.x[:, fe])
+                            self.users[u].newton_move(o, d)
+                            self.update_edge_flow()
+                            self.users[u].time = self.users[u].F(self.x[:, fe])
+                            
+            iter_number += 1                
+            
+            for u in self.active_users:
+                self.users[u].remove_path()
+        self.update_path_cost()
                 
         return self.x_sum
     
@@ -488,17 +601,22 @@ class Network(object):
                     self.users[u].x += self.users[u].assign_edge_flow(o, d)
         self.update()
         
+        for u in self.active_users:
+            self.users[u].vectorization()
+        
         iter_number = 0
         rg_old = math.inf
-
-        while iter_number < 1000:
+        
+        while iter_number < 100:
             greedy_cost = 0
             actual_cost = 0
             for u in self.active_users:
                 for o in self.users[u].source:
                     for d in self.users[u].od[int(o)]:
                         k = self.users[u].od_serial[o, d]
-                        greedy_cost += torch.min(self.users[u].cost[int(k)]) * self.users[u].q[int(k)]
+                        path_k = self.users[u].pool[int(k)]
+                        c_min = torch.min(self.users[u].cost_vec[path_k])
+                        greedy_cost += c_min * self.users[u].q[int(k)]
                 actual_cost += torch.dot(self.users[u].time, self.users[u].x)
             rg = 1 - greedy_cost / actual_cost
             g = actual_cost - greedy_cost
@@ -509,34 +627,33 @@ class Network(object):
             if rg < epsilon:
                 break
 
-            if rg / rg_old > 0.999:
+            if rg / rg_old >= 1:
                 self.r = max(0.8 * self.r, 1e-5)
                 for u in range(len(self.users)):
                     self.users[u].r = self.r
             rg_old = rg
+            for u in self.active_users:                
+                self.users[u].no_regret_learning()
+                
+            self.update_edge_flow()
+            self.update_edge_cost()
             for u in self.active_users:
-                self.users[u].x = torch.zeros(m, dtype=torch.double)
-                for o in self.users[u].source:
-                    for d in self.users[u].od[int(o)]:
-                        k = self.users[u].od_serial[o, d]
-                        self.users[u].f[int(k)] = self.users[u].projection_kl(o, d)
-                        self.users[u].x += self.users[u].assign_edge_flow(o, d)
-
-            self.update()
+                self.users[u].cost_vec = sparse_product(self.users[u].path_mat.t(), self.users[u].time)
       
-            iter_number += 1                
-            
-            for u in self.active_users:
-                self.users[u].remove_path()
+            iter_number += 1
                 
         return self.x_sum
+    
+
+def sparse_product(spmatrix, vector):
+    return torch.mm(spmatrix, vector.unsqueeze(1)).squeeze()
 
 
-with open('chicago_edge.txt', 'r') as f:
+with open('sf_edge.txt', 'r') as f:
     link_data = f.readlines()
     link_data = [line.split() for line in link_data]
     
-with open('chicago_demand.txt', 'r') as f:
+with open('sf_demand.txt', 'r') as f:
     od_data = f.readlines()
     od_data = [line.split() for line in od_data]
 
@@ -574,15 +691,16 @@ user.set_edge(s_number, t_number, F, intF=intF, dF=dF)
 network.set_users([user])
 active_users = [0]
 tic = time.time()
-network.user_equilibrium(active_users, epsilon=1e-4, delta=1, display=True)
+network.hybrid_method(active_users, epsilon=1e-4, delta=1, display=True)
 toc = time.time()
 time1 = toc - tic
 T = torch.dot(network.x_sum, Time(network.x_sum))
-
-cap.requires_grad_()
-tic = time.time()
-network.entropic_learning(active_users, epsilon=1e-4, display=True)
-toc = time.time()
-time2 = toc - tic
-T = torch.dot(network.x_sum, Time(network.x_sum))
-T.backward()
+#
+#cap.requires_grad_()
+#tic = time.time()
+#network.entropic_learning(active_users, epsilon=1e-4, display=True)
+#toc = time.time()
+#time2 = toc - tic
+#T = torch.dot(network.x_sum, Time(network.x_sum))
+#T.backward()
+#print(cap.grad)
