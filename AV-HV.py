@@ -256,8 +256,7 @@ class User(object):
         for k in range(len(self.q)):
             path_k = self.pool[k]
             p_sum[path_k] = torch.sum(self.p_vec[path_k])
-        self.p_vec /= p_sum
-                
+        self.p_vec /= p_sum          
         self.f_vec = self.p_vec * self.q_path
         self.x = sparse_product(self.path_mat, self.f_vec)
         
@@ -358,7 +357,7 @@ class Network(object):
                 actual_cost += torch.dot(self.users[u].time, self.users[u].x)
                 self.update[u] = update
             rg = 1 - greedy_cost / actual_cost
-            print('iter:', iter_number, 'relative gap:', rg)
+            #print('iter:', iter_number, 'relative gap:', rg)
             if rg < epsilon:
                 break
             
@@ -366,7 +365,7 @@ class Network(object):
             if n_update == 0:
                 delta = max(0.1 * delta, 0.8 * epsilon)
             else:
-                print('find', n_update, 'new paths')
+                #print('find', n_update, 'new paths')
                 for u in self.active_users:
                     for k in self.update[u]:
                         self.users[u].adjustment_distribution(k)
@@ -379,7 +378,7 @@ class Network(object):
                 self.update_path_cost()
             
             """Entropic Learning"""
-            self.r = 1
+            self.r = 0.1
             for u in self.active_users:
                 self.users[u].r = self.r
             irg = math.inf    
@@ -416,27 +415,51 @@ class Network(object):
     
     def entropic_learning(self, active_users, epsilon=1e-3, display=False):
         self.active_users = active_users
+#        with torch.no_grad():
+#            m = self.edge_number
+#            self.x_sum = torch.zeros(m, dtype=torch.float)
+#            self.x = torch.zeros(self.class_number, m, dtype=torch.float)
+#            self.update_edge_cost()
+#            self.update_path_cost()
+#            for u in self.active_users:
+#                l = len(self.users[u].p_vec)
+#                self.users[u].p_vec = torch.zeros(l, dtype=torch.float)
+#                self.users[u].f_vec = torch.zeros(l, dtype=torch.float)
+#                for k in range(len(self.users[u].q)):
+#                    self.users[u].softmin_distribution(k)
+#            for u in self.active_users:
+#                path = self.users[u].path_mat
+#                f = self.users[u].f_vec
+#                self.users[u].x = sparse_product(path, f)
+#            self.update_edge_flow()
+#            self.update_edge_cost()
+#            self.update_path_cost()
+        self.p_initial = list()
         with torch.no_grad():
-            m = self.edge_number
-            self.x_sum = torch.zeros(m, dtype=torch.float)
-            self.x = torch.zeros(self.class_number, m, dtype=torch.float)
-            self.update_edge_cost()
-            self.update_path_cost()
             for u in self.active_users:
-                l = len(self.users[u].p_vec)
-                self.users[u].p_vec = torch.zeros(l, dtype=torch.float)
-                self.users[u].f_vec = torch.zeros(l, dtype=torch.float)
+                p0 = torch.zeros_like(self.users[u].p_vec)
                 for k in range(len(self.users[u].q)):
-                    self.users[u].softmin_distribution(k)
-            for u in self.active_users:
-                path = self.users[u].path_mat
-                f = self.users[u].f_vec
-                self.users[u].x = sparse_product(path, f)
-            self.update_edge_flow()
-            self.update_edge_cost()
-            self.update_path_cost()
+                    path_k = self.users[u].pool[k]
+                    cost = self.users[u].cost_vec[path_k]
+                    p = torch.rand(len(cost))
+                    p /= torch.sum(p)
+                    p0[path_k] = p
+                p0.requires_grad_()
+                self.p_initial.append(p0)
+                    
+        for u in self.active_users:
+            self.users[u].p_vec = self.p_initial[u] * 1.0
+            self.users[u].f_vec = self.p_initial[u] * self.users[u].q_path
+            
+        for u in self.active_users:
+            path = self.users[u].path_mat
+            f = self.users[u].f_vec
+            self.users[u].x = sparse_product(path, f)
+        self.update_edge_flow()
+        self.update_edge_cost()
+        self.update_path_cost()
         
-        self.r = 1
+        self.r = 0.1
         for u in self.active_users:
             self.users[u].r = self.r
         rg = math.inf
@@ -455,6 +478,8 @@ class Network(object):
                     x = self.users[u].x
                     actual_cost += torch.dot(time, x)
                 rg = 1 - greedy_cost / actual_cost
+                if rg < 0:
+                    print('error')
                 if display:
                     print(rg)
             for u in self.active_users:                
@@ -476,11 +501,11 @@ def sparse_product(spmatrix, vector):
         return mvector.squeeze(0)
 
 
-with open('sf_edge.txt', 'r') as f:
+with open('braess_edge.txt', 'r') as f:
     link_data = f.readlines()
     link_data = [line.split() for line in link_data]
     
-with open('sf_demand.txt', 'r') as f:
+with open('braess_demand.txt', 'r') as f:
     od_data = f.readlines()
     od_data = [line.split() for line in od_data]
 
@@ -505,39 +530,32 @@ demand = torch.tensor([float(od[2]) for od in od_data], dtype=torch.float)
 
 network = Network(s_number, t_number)
 
-Time = lambda x: tfree * (1 + 0.15 * (x / cap) ** 4)
-F = lambda x: tfree * (1 + 0.15 * (sum(x) / cap) ** 4)
-dF = lambda x: 0.15 * 4 * (sum(x) / cap) ** 3 / cap
-intF = lambda x: tfree * (sum(x) + 0.15 * cap / 5 * (sum(x) / cap) ** 5)
+def F(x):
+    x_av = x[0, :]
+    x_hv = x[1, :]
+    x_sum = x_av + x_hv
+    prop = x_av / x_sum
+    prop[x_sum == 0] = 0
+#    prop = torch.zeros_like(x_sum)
+    cap_e = cap * (1 + prop) ** 2
+    return tfree * (1 + 0.15 * (x_sum / cap_e) ** 4)
 
-user = User(network.node_number)
-user.set_demand(a_number, b_number, demand)
-user.set_edge(s_number, t_number, F, intF=intF, dF=dF)
+alpha = 0.5
+av = User(network.node_number)
+av.set_demand(a_number, b_number, alpha * demand)
+av.set_edge(s_number, t_number, F)
 
-network.set_users([user])
-active_users = [0]
+hv = User(network.node_number)
+hv.set_demand(a_number, b_number, (1 - alpha) * demand)
+hv.set_edge(s_number, t_number, F)
+
+network.set_users([av, hv])
+active_users = [0, 1]
 network.hybrid_method(active_users, epsilon=1e-4)
-T = torch.dot(network.x_sum, Time(network.x_sum))
+T = torch.dot(network.x_sum, F(network.x))
 
-budget = torch.sum(cap) * 0.25
-expand = torch.ones_like(cap) * budget / len(cap)
-expand.requires_grad_()
-
-gamma = 5
-while True:
-    cap_new = cap + expand
-    Time = lambda x: tfree * (1 + 0.15 * (x / cap_new) ** 4)
-    F = lambda x: tfree * (1 + 0.15 * (sum(x) / cap_new) ** 4)
-    with torch.no_grad():
-        user.set_edge(s_number, t_number, F)
-        network.set_users([user])
-
-    network.entropic_learning(active_users, epsilon=5 * 1e-4)
-    T = torch.dot(network.x_sum, Time(network.x_sum))
-    print(T)
-    T.backward()
-    with torch.no_grad():
-        expand *= torch.exp(-gamma * expand.grad)
-        expand /= torch.sum(expand)
-        expand *= budget
-    expand.grad.data.zero_()
+network.entropic_learning(active_users, epsilon=1e-6, display=True)
+T = torch.dot(network.x_sum, F(network.x))
+print(T)
+T.backward()
+print(network.p_initial[0].grad, network.p_initial[1].grad)
